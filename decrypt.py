@@ -14,7 +14,6 @@ try:
     from dsmr_parser.parsers import TelegramParser
 
     from dsmr_parser import obis_references
-    import dsmr_parser.obis_name_mapping
 except ImportError:
     has_dsmr_parser = False
 
