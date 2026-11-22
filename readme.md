@@ -137,24 +137,6 @@ And then start it (or simply restart your device):
 sudo service supervisor restart
 ```
 
-## Running the tests
-
-The tests need no serial hardware: the meter is replaced by an in-memory fake connection and time is driven by a fake clock, so the whole s>
-
-```
-pip install pycryptodomex pyserial
-python3 -m unittest -v test_decrypt        # or: pytest -v test_decrypt.py
-```
-
-Run them from the directory that contains `decrypt.py` and `test_decrypt.py`. They cover:
-
-- normal operation (clean streams, leading garbage, any read chunk size, frame counter)
-- authentication (wrong key, wrong AAD and tampered frames must never be delivered)
-- recovery from lost, inserted and flipped bytes, truncated frames, corrupted headers, garbage bursts and false start bytes
-- serial handling (input reconnect, output port reuse and reopen)
-- a seeded fuzz test that injects random errors into an encrypted stream and checks that no garbled or CRC-failing telegram is ever deliver>
-
-
 ## Further information
 
 * [DSMR Component for Home Assistant](https://www.home-assistant.io/components/sensor.dsmr/)
