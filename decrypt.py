@@ -1,71 +1,62 @@
-import serial
-import binascii
 import argparse
+import binascii
+import time
 
-
+import serial
 from Cryptodome.Cipher import AES
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.ciphers import (Cipher, algorithms, modes)
-from cryptography.exceptions import InvalidTag
 
 has_dsmr_parser = True
 try:
     from dsmr_parser import telegram_specifications
     from dsmr_parser.parsers import TelegramParser
-
-    from dsmr_parser import obis_references
 except ImportError:
     has_dsmr_parser = False
 
 
-
 class SmartyProxy():
+    """Decrypts DLMS/COSEM (security suite 0) frames from a Smarty/Sagemcom meter.
+
+    Frame layout (all offsets in bytes):
+        0            0xDB (general-glo-ciphering)
+        1            system title length (normally 8)
+        2 .. 2+stl   system title
+        2+stl        0x82
+        3+stl .. 4+stl   length L of everything that follows (big endian)
+        5+stl        security byte (0x21)
+        6+stl .. 9+stl   frame counter (4 bytes)
+        ...          ciphertext (L - 17 bytes)
+        last 12      GCM tag
+    Total frame length = 5 + stl + L.
+
+    Compared to the old byte-by-byte state machine this version:
+      * buffers input and resynchronises on the next start byte whenever a
+        frame is invalid, instead of silently swallowing following frames,
+      * verifies the GCM tag (the old code never did, so corrupted frames
+        were "decrypted" to garbage and then failed the DSMR CRC check),
+      * drops partial frames after a read timeout,
+      * reconnects the serial ports after errors instead of giving up.
+    """
+
+    START_BYTE = 0xDB
+    SEPARATOR = 0x82
+    TAG_LEN = 12
+    MAX_DATA_LENGTH = 2048     # sanity limit for the length field
+    READ_TIMEOUT = 1.0         # seconds
+    STALE_AFTER = 3.0          # drop a partial frame if no data arrives for this long
+    RECONNECT_DELAY = 2.0      # seconds
+
     def __init__(self):
-        # Constants that describe the individual steps of the state machine:
+        self._args = None
+        self._callback = None
+        self._connection = None   # serial input (smart meter)
+        self._out = None          # serial output (e.g. socat pty), kept open
+        self._buf = bytearray()
+        self._last_rx = time.monotonic()
+        self._key = b""
+        self._aad = b""
+        self._parser = None
 
-        # Initial state. Input is ignored until start byte is detected.
-        self.STATE_IGNORING = 0
-        # Start byte (hex "DB") has been detected.
-        self.STATE_STARTED = 1
-        # Length of system title has been read.
-        self.STATE_HAS_SYSTEM_TITLE_LENGTH = 2
-        # System title has been read.
-        self.STATE_HAS_SYSTEM_TITLE = 3
-        # Additional byte after the system title has been read.
-        self.STATE_HAS_SYSTEM_TITLE_SUFFIX = 4
-        # Length of remaining data has been read.
-        self.STATE_HAS_DATA_LENGTH = 5
-        # Additional byte after the remaining data length has been read.
-        self.STATE_HAS_SEPARATOR = 6
-        # Frame counter has been read.
-        self.STATE_HAS_FRAME_COUNTER = 7
-        # Payload has been read.
-        self.STATE_HAS_PAYLOAD = 8
-        # GCM tag has been read.
-        self.STATE_HAS_GCM_TAG = 9
-        # All input has been read. After this, we switch back to STATE_IGNORING and wait for a new start byte.
-        self.STATE_DONE = 10
-
-        # Command line arguments
-        self._args = {}
-
-        # Serial connection from which we read the data from the smart meter
-        self._connection = None
-
-        # Initial empty values. These will be filled as content is read
-        # and they will be reset each time we go back to the initial state.
-        self._state = self.STATE_IGNORING
-        self._buffer = ""
-        self._buffer_length = 0
-        self._next_state = 0
-        self._system_title_length = 0
-        self._system_title = b""
-        self._data_length_bytes = b""  # length of "remaining data" in bytes
-        self._data_length = 0  # length of "remaining data" as an integer
-        self._frame_counter = b""
-        self._payload = b""
-        self._gcm_tag = b""
-
+    # ------------------------------------------------------------------ setup
     def main(self, cmdline=None, callback=None):
         parser = argparse.ArgumentParser()
         parser.add_argument('key', help="Decryption key")
@@ -83,209 +74,180 @@ class SmartyProxy():
         #   callback(framecounter, dsmr_parser.telegram or text, error)
         self._callback = callback
 
-        self.connect()
+        self._key = binascii.unhexlify(self._args.key)
+        self._aad = binascii.unhexlify(self._args.aad)
+        if has_dsmr_parser and self._args.parse:
+            self._parser = TelegramParser(telegram_specifications.V5)
+
         while True:
-            self.process()
+            try:
+                self.process()
+            except (serial.SerialException, OSError) as err:
+                self._report(f'Serial error {err!r}, reconnecting in {self.RECONNECT_DELAY}s')
+                self._close_input()
+                self._buf.clear()
+                time.sleep(self.RECONNECT_DELAY)
 
-    # Connect to the serial port when we run the script
     def connect(self):
-        try:
-            self._connection = serial.Serial(
-                port=self._args.serial_input_port,
-                baudrate=115200,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-            )
-        except (serial.SerialException, OSError) as err:
-            if self._callback:
-                self._callback(None, None, f'Serial error{repr(err)}')
-            else:
-                print(f'Serial error{repr(err)}')
-
-    # Start processing incoming data
-    def process(self):
-        try:
-            raw_data = self._connection.read()
-        except serial.SerialException:
-            return
-
-        # Read and parse the stream from the serial port byte by byte.
-        # This parsing works as a state machine (see the definitions in the __init__ method).
-        # See also the official documentation on http://smarty.creos.net/wp-content/uploads/P1PortSpecification.pdf
-        # For better human readability, we use the hexadecimal representation of the input.
-        hex_input = binascii.hexlify(raw_data)
-
-        # Initial state. Input is ignored until start byte is detected.
-        if self._state == self.STATE_IGNORING:
-            if hex_input == b'db':
-                self._state = self.STATE_STARTED
-                self._buffer = b""
-                self._buffer_length = 1
-                self._system_title_length = 0
-                self._system_title = b""
-                self._data_length = 0
-                self._data_length_bytes = b""
-                self._frame_counter = b""
-                self._payload = b""
-                self._gcm_tag = b""
-            else:
-                return
-
-        # Start byte (hex "DB") has been detected.
-        elif self._state == self.STATE_STARTED:
-            self._state = self.STATE_HAS_SYSTEM_TITLE_LENGTH
-            self._system_title_length = int(hex_input, 16)
-            self._buffer_length = self._buffer_length + 1
-            self._next_state = 2 + self._system_title_length  # start bytes + system title length
-
-        # Length of system title has been read.
-        elif self._state == self.STATE_HAS_SYSTEM_TITLE_LENGTH:
-            if self._buffer_length > self._next_state:
-                self._system_title += hex_input
-                self._state = self.STATE_HAS_SYSTEM_TITLE
-                self._next_state = self._next_state + 2  # read two more bytes
-            else:
-                self._system_title += hex_input
-
-        # System title has been read.
-        elif self._state == self.STATE_HAS_SYSTEM_TITLE:
-            if hex_input == b'82':
-                self._next_state = self._next_state + 1
-                self._state = self.STATE_HAS_SYSTEM_TITLE_SUFFIX  # Ignore separator byte
-            else:
-                msg = 'ERROR, expected 0x82 separator byte not found, dropping frame'
-                if self._callback:
-                    self._callback(None, None, msg)
-                else:
-                    print(msg)
-                self._state = self.STATE_IGNORING
-
-        # Additional byte after the system title has been read.
-        elif self._state == self.STATE_HAS_SYSTEM_TITLE_SUFFIX:
-            if self._buffer_length > self._next_state:
-                self._data_length_bytes += hex_input
-                self._data_length = int(self._data_length_bytes, 16)
-                self._state = self.STATE_HAS_DATA_LENGTH
-            else:
-                self._data_length_bytes += hex_input
-
-        # Length of remaining data has been read.
-        elif self._state == self.STATE_HAS_DATA_LENGTH:
-            self._state = self.STATE_HAS_SEPARATOR  # Ignore separator byte
-            self._next_state = self._next_state + 1 + 4  # separator byte + 4 bytes for framecounter
-
-        # Additional byte after the remaining data length has been read.
-        elif self._state == self.STATE_HAS_SEPARATOR:
-            if self._buffer_length > self._next_state:
-                self._frame_counter += hex_input
-                if self._callback:
-                    self._callback(self._frame_counter, None, None)
-                else:
-                    print("Framecounter")
-                    print(self._frame_counter)
-                self._state = self.STATE_HAS_FRAME_COUNTER
-                self._next_state = self._next_state + self._data_length - 17
-            else:
-                self._frame_counter += hex_input
-
-        # Frame counter has been read.
-        elif self._state == self.STATE_HAS_FRAME_COUNTER:
-            if self._buffer_length > self._next_state:
-                self._payload += hex_input
-                self._state = self.STATE_HAS_PAYLOAD
-                self._next_state = self._next_state + 12
-            else:
-                self._payload += hex_input
-
-        # Payload has been read.
-        elif self._state == self.STATE_HAS_PAYLOAD:
-            # All input has been read. After this, we switch back to STATE_IGNORING and wait for a new start byte.
-            if self._buffer_length > self._next_state:
-                self._gcm_tag += hex_input
-                self._state = self.STATE_DONE
-            else:
-                self._gcm_tag += hex_input
-
-        self._buffer += hex_input
-        self._buffer_length = self._buffer_length + 1
-
-        if self._state == self.STATE_DONE:
-            # print(self._buffer)
-            self.analyze()
-            self._state = self.STATE_IGNORING
-
-    # Once we have a full encrypted "telegram", put everything together for decryption.
-    def analyze(self):
-        key = binascii.unhexlify(self._args.key)
-        additional_data = binascii.unhexlify(self._args.aad)
-        iv = binascii.unhexlify(self._system_title + self._frame_counter)
-        payload = binascii.unhexlify(self._payload)
-        gcm_tag = binascii.unhexlify(self._gcm_tag)
-
-        try:
-            decryption = self.decrypt(
-                key,
-                additional_data,
-                iv,
-                payload,
-                gcm_tag
-            )
-            if has_dsmr_parser and self._args.parse:
-
-                try:
-                    parser = TelegramParser(telegram_specifications.V5)
-
-                    msg = decryption.decode('utf-8', errors='ignore')
-                    # have to convert between bytes and str otherwise parser fails
-                    telegram = parser.parse(str(bytes(msg, 'utf-8'), 'utf-8'))
-                    if self._callback:
-                        self._callback(None, telegram, None)
-                    else:
-                        print(telegram)
-                except Exception as e:
-                    msg = "ERROR: Cannot parse DSMR Telegram" + repr(e) + \
-                          "\n" + decryption.decode('utf-8', errors='ignore')
-                    if self._callback:
-                        self._callback(None, None, msg)
-                    else:
-                        print(msg)
-            else:
-                msg = decryption.decode('utf-8', errors='ignore')
-                if self._callback:
-                    self._callback(None, msg, None)
-                else:
-                    print(msg)
-
-            if self._args.serial_output_port:
-                self.write_to_serial_port(decryption)
-        except InvalidTag:
-            print("ERROR: Invalid Tag.")
-
-    # Do the actual decryption (AES-GCM)
-    def decrypt(self, key, additional_data, iv, payload, gcm_tag):
-    #        decryptor = Cipher(
-    #            algorithms.AES(key),
-    #            modes.GCM(iv, gcm_tag, 12),
-    #            backend=default_backend()
-    #        ).decryptor()
-    #
-    #        decryptor.authenticate_additional_data(additional_data)##
-    #
-    #        return decryptor.update(payload) + decryptor.finalize()
-        cipher = AES.new(key, AES.MODE_GCM, iv, mac_len=12)
-        cipher.update(additional_data)
-        return cipher.decrypt(payload)
-
-    # Write the decrypted data to a serial port (e.g. one created with socat)
-    def write_to_serial_port(self, decryption):
-        ser = serial.Serial(
-            port=self._args.serial_output_port,
+        self._connection = serial.Serial(
+            port=self._args.serial_input_port,
             baudrate=115200,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
+            timeout=self.READ_TIMEOUT,
         )
-        ser.write(decryption)
-        ser.close()
+        self._buf.clear()
+        self._last_rx = time.monotonic()
+
+    def _close_input(self):
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except Exception:
+                pass
+        self._connection = None
+
+    def _report(self, msg):
+        if self._callback:
+            self._callback(None, None, msg)
+        else:
+            print(msg)
+
+    # ------------------------------------------------------------- read loop
+    def process(self):
+        """One iteration of the read loop. Serial errors propagate to main()."""
+        if self._connection is None:
+            self.connect()
+
+        chunk = self._connection.read(max(1, self._connection.in_waiting))
+        now = time.monotonic()
+        if chunk:
+            self._buf.extend(chunk)
+            self._last_rx = now
+        elif self._buf and now - self._last_rx > self.STALE_AFTER:
+            # Half a frame and then silence: the rest was lost. Give up on the
+            # pending start byte, but rescan what is behind it: a complete,
+            # valid frame may be hiding there (e.g. after a false start byte
+            # whose length field claimed more data than ever arrived).
+            self._report('WARNING: incomplete frame timed out, resynchronising')
+            while self._buf:
+                del self._buf[:1]
+                self._extract_frames()
+            return
+
+        self._extract_frames()
+
+    def _extract_frames(self):
+        buf = self._buf
+        while True:
+            start = buf.find(bytes([self.START_BYTE]))
+            if start < 0:
+                buf.clear()
+                return
+            if start > 0:
+                del buf[:start]
+
+            if len(buf) < 2:
+                return
+            stl = buf[1]
+            if stl == 0 or stl > 16:
+                del buf[:1]            # not a plausible header, resync
+                continue
+
+            header_len = 2 + stl + 3   # start, stl, system title, 0x82, 2 length bytes
+            if len(buf) < header_len:
+                return
+            if buf[2 + stl] != self.SEPARATOR:
+                del buf[:1]
+                continue
+
+            data_length = (buf[3 + stl] << 8) | buf[4 + stl]
+            # security byte (1) + frame counter (4) + tag (12) = 17 bytes minimum
+            if data_length < 1 + 4 + self.TAG_LEN or data_length > self.MAX_DATA_LENGTH:
+                del buf[:1]
+                continue
+
+            total = 5 + stl + data_length
+            if len(buf) < total:
+                return                 # wait for more data
+
+            frame = bytes(buf[:total])
+            if self._handle_frame(frame, stl):
+                del buf[:total]
+            else:
+                # Invalid frame: it may have been a false start byte inside
+                # garbage, so only skip one byte and look for the next 0xDB.
+                del buf[:1]
+
+    # ------------------------------------------------------------ one frame
+    def _handle_frame(self, frame, stl):
+        system_title = frame[2:2 + stl]
+        body = frame[5 + stl:]
+        frame_counter = body[1:5]
+        payload = body[5:-self.TAG_LEN]
+        gcm_tag = body[-self.TAG_LEN:]
+
+        try:
+            cipher = AES.new(self._key, AES.MODE_GCM, nonce=system_title + frame_counter, mac_len=self.TAG_LEN)
+            cipher.update(self._aad)
+            decryption = cipher.decrypt_and_verify(payload, gcm_tag)
+        except ValueError:
+            self._report('ERROR: Invalid Tag (corrupt frame or wrong key/AAD), dropping frame')
+            return False
+
+        counter_hex = binascii.hexlify(frame_counter)
+        if self._callback:
+            self._callback(counter_hex, None, None)
+        else:
+            print("Framecounter")
+            print(counter_hex)
+
+        self._deliver(decryption)
+
+        if self._args.serial_output_port:
+            self.write_to_serial_port(decryption)
+        return True
+
+    def _deliver(self, decryption):
+        msg = decryption.decode('utf-8', errors='replace')
+        if self._parser is not None:
+            try:
+                telegram = self._parser.parse(msg)
+                if self._callback:
+                    self._callback(None, telegram, None)
+                else:
+                    print(telegram)
+            except Exception as e:
+                self._report("ERROR: Cannot parse DSMR Telegram" + repr(e) + "\n" + msg)
+        else:
+            if self._callback:
+                self._callback(None, msg, None)
+            else:
+                print(msg)
+
+    # --------------------------------------------------------------- output
+    def write_to_serial_port(self, decryption):
+        """Write to the output port (e.g. a socat pty). The port is kept open
+        between telegrams and re-opened after any error."""
+        try:
+            if self._out is None:
+                self._out = serial.Serial(
+                    port=self._args.serial_output_port,
+                    baudrate=115200,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    write_timeout=2,
+                )
+            self._out.write(decryption)
+            self._out.flush()
+        except (serial.SerialException, OSError) as err:
+            self._report(f'Output port error {err!r}, will retry on next telegram')
+            try:
+                if self._out is not None:
+                    self._out.close()
+            except Exception:
+                pass
+            self._out = None
 
 
 if __name__ == '__main__':
