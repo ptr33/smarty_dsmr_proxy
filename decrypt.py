@@ -290,7 +290,7 @@ class SmartyProxy():
             if self._args.serial_output_port:
                 self.write_to_serial_port(decryption)
         except (InvalidTag, ValueError) as e:
-            self._report_error(f"ERROR: Invalid GCM tag, dropping frame ({e})")
+            self._report_error(f"ERROR: Decryption failed, dropping frame ({e})")
 
     # Do the actual decryption (AES-GCM)
     def decrypt(self, key, additional_data, iv, payload, gcm_tag):
@@ -305,7 +305,9 @@ class SmartyProxy():
     #        return decryptor.update(payload) + decryptor.finalize()
         cipher = AES.new(key, AES.MODE_GCM, iv, mac_len=12)
         cipher.update(additional_data)
-        return cipher.decrypt_and_verify(payload, gcm_tag)
+        # The GCM tag is not verified: it depends on the meter's authentication key (AAD),
+        # which is often unknown. Corrupt frames are caught by the DSMR CRC check instead.
+        return cipher.decrypt(payload)
 
     # Write the decrypted data to a serial port (e.g. one created with socat)
     def write_to_serial_port(self, decryption):
