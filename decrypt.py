@@ -106,6 +106,7 @@ class SmartyProxy():
                 baudrate=115200,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
+                timeout=0.5,
             )
         except (serial.SerialException, OSError) as err:
             if self._callback:
@@ -129,6 +130,14 @@ class SmartyProxy():
             self._state = self.STATE_IGNORING
             time.sleep(5)
             self.connect()
+            return
+
+        if not raw_data:
+            # Line idle (read timeout): telegrams are sent as continuous bursts, so an
+            # unfinished frame has lost bytes. Drop it so the next telegram is not consumed.
+            if self._state != self.STATE_IGNORING:
+                self._report_error("ERROR: incomplete frame (bytes lost), dropping frame")
+                self._state = self.STATE_IGNORING
             return
 
         # Read and parse the stream from the serial port byte by byte.
