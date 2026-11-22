@@ -1,5 +1,6 @@
 import serial
 import binascii
+import time
 import argparse
 
 
@@ -85,7 +86,17 @@ class SmartyProxy():
 
         self.connect()
         while True:
-            self.process()
+            try:
+                self.process()
+            except Exception as e:
+                self._state = self.STATE_IGNORING
+                self._report_error(f"ERROR: {e!r}")
+
+    def _report_error(self, msg):
+        if self._callback:
+            self._callback(None, None, msg)
+        else:
+            print(msg)
 
     # Connect to the serial port when we run the script
     def connect(self):
@@ -106,7 +117,18 @@ class SmartyProxy():
     def process(self):
         try:
             raw_data = self._connection.read()
-        except serial.SerialException:
+        except (serial.SerialException, OSError, AttributeError) as err:
+            # AttributeError: initial connect failed and _connection is None
+            self._report_error(f"Serial read error {err!r}, reconnecting")
+            try:
+                if self._connection:
+                    self._connection.close()
+            except Exception:
+                pass
+            self._connection = None
+            self._state = self.STATE_IGNORING
+            time.sleep(5)
+            self.connect()
             return
 
         # Read and parse the stream from the serial port byte by byte.
@@ -133,8 +155,13 @@ class SmartyProxy():
 
         # Start byte (hex "DB") has been detected.
         elif self._state == self.STATE_STARTED:
-            self._state = self.STATE_HAS_SYSTEM_TITLE_LENGTH
             self._system_title_length = int(hex_input, 16)
+            if self._system_title_length != 8:
+                # stray 0xDB byte, not a frame start; this byte may itself be a new start byte
+                if hex_input != b'db':
+                    self._state = self.STATE_IGNORING
+                return
+            self._state = self.STATE_HAS_SYSTEM_TITLE_LENGTH
             self._buffer_length = self._buffer_length + 1
             self._next_state = 2 + self._system_title_length  # start bytes + system title length
 
@@ -165,6 +192,10 @@ class SmartyProxy():
             if self._buffer_length > self._next_state:
                 self._data_length_bytes += hex_input
                 self._data_length = int(self._data_length_bytes, 16)
+                if not (17 < self._data_length < 4096):
+                    self._report_error(f"ERROR, implausible data length {self._data_length}, dropping frame")
+                    self._state = self.STATE_IGNORING
+                    return
                 self._state = self.STATE_HAS_DATA_LENGTH
             else:
                 self._data_length_bytes += hex_input
@@ -258,8 +289,8 @@ class SmartyProxy():
 
             if self._args.serial_output_port:
                 self.write_to_serial_port(decryption)
-        except InvalidTag:
-            print("ERROR: Invalid Tag.")
+        except (InvalidTag, ValueError) as e:
+            self._report_error(f"ERROR: Invalid GCM tag, dropping frame ({e})")
 
     # Do the actual decryption (AES-GCM)
     def decrypt(self, key, additional_data, iv, payload, gcm_tag):
@@ -274,7 +305,7 @@ class SmartyProxy():
     #        return decryptor.update(payload) + decryptor.finalize()
         cipher = AES.new(key, AES.MODE_GCM, iv, mac_len=12)
         cipher.update(additional_data)
-        return cipher.decrypt(payload)
+        return cipher.decrypt_and_verify(payload, gcm_tag)
 
     # Write the decrypted data to a serial port (e.g. one created with socat)
     def write_to_serial_port(self, decryption):
